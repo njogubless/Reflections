@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// Devotion — Reflections of Faith: Cloud Storage Security Rules.
+// Read access follows the publication state of the owning Firestore document.
+// Size/type limits must match lib/core/media/file_picking.dart and
+// RecordingLimits in lib/features/recording/domain/entities/recording_submission.dart.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && request.auth.token.get('role', '') == 'admin'; }
+    function under(mb) { return request.resource.size > 0 && request.resource.size <= mb * 1024 * 1024; }
+    function isImage() { return request.resource.contentType.matches('image/(jpeg|png|webp)'); }
+    function isAudio() { return request.resource.contentType.matches('audio/.*'); }
+    function fsDoc(col, id) { return /databases/(default)/documents/$(col)/$(id); }
+    function published(col, id) {
+      return firestore.exists(fsDoc(col, id)) && firestore.get(fsDoc(col, id)).data.status == 'published';
+    }
+
+    // Admin-uploaded sermon audio and covers.
+    match /sermons/published/{sermonId}/{file} {
+      allow read: if isAdmin() || (signedIn() && published('sermons', sermonId));
+      allow create, update: if isAdmin()
+        && ((file == 'audio' && isAudio() && under(200))
+            || (file == 'cover' && isImage() && under(5)));
+      allow delete: if isAdmin();
+    }
+
+    // User recordings: private to owner + admins until published as a sermon.
+    match /recordings/{ownerUid}/{recordingId}/audio {
+      allow read: if signedIn()
+        && (request.auth.uid == ownerUid || isAdmin() || published('sermons', 'rec_' + recordingId));
+      // Owners may upload before submitting, or replace audio only while the
+      // submission is returned for changes. Never overwrite another user's file.
+      allow create, update: if signedIn() && request.auth.uid == ownerUid
+        && isAudio() && under(25)
+        && (!firestore.exists(fsDoc('recordings', recordingId))
+            || (firestore.get(fsDoc('recordings', recordingId)).data.ownerUid == ownerUid
+                && firestore.get(fsDoc('recordings', recordingId)).data.status == 'changes_requested'));
+      allow delete: if false;
+    }
+
+    match /books/{bookId}/{file} {
+      allow read: if isAdmin() || (signedIn() && published('books', bookId));
+      allow create, update: if isAdmin()
+        && ((file == 'document' && request.resource.contentType == 'application/pdf' && under(50))
+            || (file == 'cover' && isImage() && under(5)));
+      allow delete: if isAdmin();
+    }
+
+    match /articles/{articleId}/cover {
+      allow read: if isAdmin() || (signedIn() && published('articles', articleId));
+      allow create, update: if isAdmin() && isImage() && under(5);
+      allow delete: if isAdmin();
+    }
+
+    // Everything else is denied.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

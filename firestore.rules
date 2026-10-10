@@ -1,0 +1,395 @@
+rules_version = '2';
+
+// Devotion — Reflections of Faith: Firestore Security Rules.
+//
+// Roles come only from Firebase Auth custom claims (request.auth.token.role),
+// assigned with the Admin SDK (functions/scripts/set-role.js). Clients can
+// never write a role. Keep the transition tables in sync with
+//   lib/features/recording/domain/entities/recording_status.dart
+//   lib/core/domain/content_status.dart
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------ helpers
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isAdmin() { return signedIn() && request.auth.token.get('role', '') == 'admin'; }
+
+    // Recording eligibility policy (RecordingPolicy.canRecord on the client).
+    function canSubmitRecordings() { return signedIn(); }
+
+    function next() { return request.resource.data; }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanges(keys) { return changedKeys().hasOnly(keys); }
+
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function optStr(v, max) { return v == null || (v is string && v.size() <= max); }
+    function nowStamped(field) { return next()[field] == request.time; }
+    function docPath(col, id) { return /databases/$(database)/documents/$(col)/$(id); }
+
+    function contentStatus(s) { return s in ['draft', 'published', 'unpublished', 'archived']; }
+    function contentTransition(from, to) {
+      return from == to
+        || (from == 'draft' && to in ['published', 'archived'])
+        || (from == 'published' && to in ['unpublished', 'archived'])
+        || (from == 'unpublished' && to in ['published', 'draft', 'archived'])
+        || (from == 'archived' && to == 'draft');
+    }
+    // publishedAt is set exactly once, on first publication.
+    function publishedAtValid() {
+      return next().publishedAt == resource.data.publishedAt
+        || (resource.data.publishedAt == null
+            && next().status == 'published'
+            && next().publishedAt == request.time);
+    }
+    function keywordsValid(d) { return d.keywords is list && d.keywords.size() <= 60; }
+
+    // ------------------------------------------------------------ users
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isAdmin());
+      // `role` is never client-writable: it is absent from the allowed keys.
+      allow create: if signedIn() && uid() == userId
+        && next().keys().hasOnly(['displayName', 'email', 'photoUrl', 'createdAt', 'updatedAt'])
+        && str(next().displayName, 0, 80)
+        && next().email == request.auth.token.get('email', null)
+        && optStr(next().photoUrl, 1000)
+        && nowStamped('createdAt') && nowStamped('updatedAt');
+      allow update: if signedIn() && uid() == userId
+        && onlyChanges(['displayName', 'photoUrl', 'updatedAt'])
+        && str(next().displayName, 0, 80)
+        && optStr(next().photoUrl, 1000)
+        && nowStamped('updatedAt');
+      allow delete: if false;
+
+      // Created only by Cloud Functions (Admin SDK). Owners may mark read.
+      match /notifications/{notificationId} {
+        allow read: if signedIn() && uid() == userId;
+        allow update: if signedIn() && uid() == userId
+          && onlyChanges(['readAt'])
+          && nowStamped('readAt');
+        allow create, delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------ sermons
+    function validSermon(d) {
+      return d.keys().hasOnly(['title', 'description', 'speakerName', 'scriptureReference',
+          'scriptureQuote', 'category', 'featured', 'keywords', 'sourceType', 'status',
+          'storagePath', 'coverStoragePath', 'durationSeconds', 'audioSizeBytes', 'uploadedBy',
+          'originRecordingId', 'publishedAt', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['title', 'sourceType', 'status', 'uploadedBy', 'createdAt', 'updatedAt'])
+        && str(d.title, 1, 140)
+        && str(d.description, 0, 2000)
+        && str(d.speakerName, 0, 120)
+        && str(d.scriptureReference, 0, 120)
+        && optStr(d.get('scriptureQuote', null), 400)
+        && str(d.category, 0, 60)
+        && d.featured is bool
+        && keywordsValid(d)
+        && d.sourceType in ['admin_published', 'user_submission']
+        && contentStatus(d.status)
+        && d.durationSeconds is int && d.durationSeconds >= 0
+        && d.audioSizeBytes is int && d.audioSizeBytes >= 0;
+    }
+
+    match /sermons/{sermonId} {
+      // Rules are not filters: list queries must constrain status == published.
+      allow read: if isAdmin() || (signedIn() && resource.data.status == 'published');
+
+      allow create: if isAdmin()
+        && validSermon(next())
+        && next().uploadedBy == uid()
+        && nowStamped('createdAt') && nowStamped('updatedAt')
+        && (
+          // Admin upload workflow: always starts as an empty draft.
+          (next().sourceType == 'admin_published'
+            && next().status == 'draft'
+            && next().storagePath == null
+            && next().originRecordingId == null
+            && next().publishedAt == null)
+          ||
+          // Publication of an approved user recording. Deterministic ID, and
+          // the recording must move approved -> published in the same write.
+          (next().sourceType == 'user_submission'
+            && sermonId == 'rec_' + next().originRecordingId
+            && next().status == 'published'
+            && nowStamped('publishedAt')
+            && get(docPath('recordings', next().originRecordingId)).data.status == 'approved'
+            && getAfter(docPath('recordings', next().originRecordingId)).data.status == 'published'
+            && next().storagePath == get(docPath('recordings', next().originRecordingId)).data.storagePath)
+        );
+
+      allow update: if isAdmin()
+        && validSermon(next())
+        // Classification and provenance are immutable.
+        && next().sourceType == resource.data.sourceType
+        && next().uploadedBy == resource.data.uploadedBy
+        && next().originRecordingId == resource.data.originRecordingId
+        && next().createdAt == resource.data.createdAt
+        && nowStamped('updatedAt')
+        && contentTransition(resource.data.status, next().status)
+        && publishedAtValid()
+        && (next().status != 'published' || next().storagePath != null)
+        && (resource.data.sourceType == 'admin_published'
+              ? (next().storagePath == null || next().storagePath == 'sermons/published/' + sermonId + '/audio')
+              : next().storagePath == resource.data.storagePath)
+        && (next().coverStoragePath == null
+            || next().coverStoragePath == 'sermons/published/' + sermonId + '/cover');
+
+      allow delete: if false; // archive instead
+    }
+
+    // ------------------------------------------------------------ recordings
+    function validRecordingMeta(d) {
+      return str(d.title, 1, 140)
+        && str(d.description, 0, 2000)
+        && str(d.speakerName, 0, 120)
+        && str(d.scriptureReference, 0, 120);
+    }
+    function validMedia(d) {
+      return d.durationSeconds is int && d.durationSeconds > 0 && d.durationSeconds <= 1200
+        && d.sizeBytes is int && d.sizeBytes > 0 && d.sizeBytes <= 26214400;
+    }
+
+    match /recordings/{recordingId} {
+      // Owners and admins only. A get of a missing document reveals nothing,
+      // which lets clients retry submissions idempotently.
+      allow get: if signedIn() && (resource == null || resource.data.ownerUid == uid() || isAdmin());
+      allow list: if isAdmin() || (signedIn() && resource.data.ownerUid == uid());
+
+      allow create: if canSubmitRecordings()
+        && next().keys().hasOnly(['ownerUid', 'ownerName', 'title', 'description', 'speakerName',
+            'scriptureReference', 'storagePath', 'durationSeconds', 'sizeBytes', 'status',
+            'revision', 'reviewFeedback', 'reviewedBy', 'reviewerName', 'reviewedAt',
+            'publishedSermonId', 'submittedAt', 'createdAt', 'updatedAt'])
+        && next().ownerUid == uid()
+        && str(next().ownerName, 0, 80)
+        && validRecordingMeta(next())
+        && validMedia(next())
+        && next().storagePath == 'recordings/' + uid() + '/' + recordingId + '/audio'
+        // Never auto-published: a new record is always `submitted`.
+        && next().status == 'submitted'
+        && next().revision == 1
+        && next().reviewFeedback == null && next().reviewedBy == null
+        && next().reviewerName == null && next().reviewedAt == null
+        && next().publishedSermonId == null
+        && nowStamped('submittedAt') && nowStamped('createdAt') && nowStamped('updatedAt');
+
+      allow update: if ownerResubmits() || adminReviews();
+
+      // changes_requested -> submitted, by the owner only.
+      function ownerResubmits() {
+        return signedIn() && resource.data.ownerUid == uid()
+          && resource.data.status == 'changes_requested'
+          && next().status == 'submitted'
+          && onlyChanges(['title', 'description', 'speakerName', 'scriptureReference',
+              'durationSeconds', 'sizeBytes', 'status', 'revision', 'submittedAt', 'updatedAt'])
+          && validRecordingMeta(next())
+          && validMedia(next())
+          && next().revision == resource.data.revision + 1
+          && nowStamped('submittedAt') && nowStamped('updatedAt');
+      }
+
+      function adminReviews() {
+        let from = resource.data.status;
+        let to = next().status;
+        return isAdmin()
+          && onlyChanges(['status', 'reviewedBy', 'reviewerName', 'reviewedAt', 'reviewFeedback',
+              'publishedSermonId', 'updatedAt'])
+          && next().reviewedBy == uid()
+          && str(next().reviewerName, 0, 80)
+          && nowStamped('reviewedAt') && nowStamped('updatedAt')
+          && (
+            (from == 'submitted' && to == 'under_review'
+              && next().reviewFeedback == resource.data.reviewFeedback
+              && next().publishedSermonId == null)
+            || (from == 'under_review' && to == 'approved'
+              && optStr(next().reviewFeedback, 2000)
+              && next().publishedSermonId == null)
+            // Rejections and change requests must explain why.
+            || (from == 'under_review' && to in ['rejected', 'changes_requested']
+              && str(next().reviewFeedback, 10, 2000)
+              && next().publishedSermonId == null)
+            // Publication creates sermons/rec_{id} in the same write.
+            || (from == 'approved' && to == 'published'
+              && next().publishedSermonId == 'rec_' + recordingId
+              && next().reviewFeedback == resource.data.reviewFeedback
+              && getAfter(docPath('sermons', 'rec_' + recordingId)).data.status == 'published')
+          );
+      }
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ books
+    function validBook(d) {
+      return d.keys().hasOnly(['title', 'author', 'description', 'category', 'featured', 'keywords',
+          'status', 'coverStoragePath', 'fileStoragePath', 'fileFormat', 'fileSizeBytes',
+          'uploadedBy', 'publishedAt', 'createdAt', 'updatedAt'])
+        && str(d.title, 1, 140)
+        && str(d.author, 0, 120)
+        && str(d.description, 0, 2000)
+        && str(d.category, 0, 60)
+        && d.featured is bool
+        && keywordsValid(d)
+        && contentStatus(d.status)
+        && d.fileFormat in [null, 'pdf']
+        && d.fileSizeBytes is int && d.fileSizeBytes >= 0 && d.fileSizeBytes <= 52428800;
+    }
+
+    match /books/{bookId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.status == 'published');
+      allow create: if isAdmin() && validBook(next())
+        && next().status == 'draft'
+        && next().uploadedBy == uid()
+        && next().fileStoragePath == null && next().coverStoragePath == null
+        && next().publishedAt == null
+        && nowStamped('createdAt') && nowStamped('updatedAt');
+      allow update: if isAdmin() && validBook(next())
+        && next().uploadedBy == resource.data.uploadedBy
+        && next().createdAt == resource.data.createdAt
+        && nowStamped('updatedAt')
+        && contentTransition(resource.data.status, next().status)
+        && publishedAtValid()
+        && (next().status != 'published' || (next().fileStoragePath != null && next().fileFormat == 'pdf'))
+        && (next().fileStoragePath == null || next().fileStoragePath == 'books/' + bookId + '/document')
+        && (next().coverStoragePath == null || next().coverStoragePath == 'books/' + bookId + '/cover');
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ articles
+    function validArticle(d) {
+      return d.keys().hasOnly(['title', 'summary', 'blocks', 'category', 'tags', 'readMinutes',
+          'keywords', 'status', 'authorId', 'authorName', 'coverStoragePath', 'publishedAt',
+          'createdAt', 'updatedAt'])
+        && str(d.title, 1, 140)
+        && str(d.summary, 0, 500)
+        && d.blocks is list && d.blocks.size() <= 500
+        && str(d.category, 0, 60)
+        && d.tags is list && d.tags.size() <= 20
+        && d.readMinutes is int
+        && keywordsValid(d)
+        && contentStatus(d.status)
+        && str(d.authorName, 0, 120);
+    }
+
+    match /articles/{articleId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.status == 'published');
+      allow create: if isAdmin() && validArticle(next())
+        && next().status == 'draft'
+        && next().authorId == uid()
+        && next().coverStoragePath == null
+        && next().publishedAt == null
+        && nowStamped('createdAt') && nowStamped('updatedAt');
+      allow update: if isAdmin() && validArticle(next())
+        && next().authorId == resource.data.authorId
+        && next().createdAt == resource.data.createdAt
+        && nowStamped('updatedAt')
+        && contentTransition(resource.data.status, next().status)
+        && publishedAtValid()
+        && (next().status != 'published' || next().blocks.size() > 0)
+        && (next().coverStoragePath == null || next().coverStoragePath == 'articles/' + articleId + '/cover');
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ Q&A
+    function canReadQuestion(q) {
+      return q.ownerUid == uid() || isAdmin()
+        || (q.visibility == 'public' && q.status == 'answered');
+    }
+
+    match /questions/{questionId} {
+      allow get: if signedIn() && (resource == null || canReadQuestion(resource.data));
+      allow list: if isAdmin()
+        || (signedIn() && (resource.data.ownerUid == uid()
+            || (resource.data.visibility == 'public' && resource.data.status == 'answered')));
+
+      allow create: if signedIn()
+        && next().keys().hasOnly(['ownerUid', 'title', 'body', 'category', 'scriptureReference',
+            'visibility', 'status', 'answeredAt', 'answeredByName', 'createdAt', 'updatedAt'])
+        && next().ownerUid == uid()
+        && str(next().title, 1, 140)
+        && str(next().body, 0, 4000)
+        && str(next().category, 0, 60)
+        && str(next().scriptureReference, 0, 120)
+        && next().visibility in ['private', 'public']
+        && next().status == 'open'
+        && next().answeredAt == null && next().answeredByName == null
+        && nowStamped('createdAt') && nowStamped('updatedAt');
+
+      allow update: if ownerCloses() || adminUpdatesQuestion();
+
+      function ownerCloses() {
+        return signedIn() && resource.data.ownerUid == uid()
+          && resource.data.status == 'open' && next().status == 'closed'
+          && onlyChanges(['status', 'updatedAt']) && nowStamped('updatedAt');
+      }
+
+      function answerAfter() {
+        return getAfter(/databases/$(database)/documents/questions/$(questionId)/answers/official);
+      }
+
+      // A question's status always matches its official answer's state.
+      function adminUpdatesQuestion() {
+        let from = resource.data.status;
+        let to = next().status;
+        return isAdmin()
+          && onlyChanges(['status', 'answeredAt', 'answeredByName', 'updatedAt'])
+          && nowStamped('updatedAt')
+          && (
+            (to == 'answered' && from != 'closed'
+              && answerAfter().data.status == 'published'
+              && nowStamped('answeredAt') && str(next().answeredByName, 0, 80))
+            || (from == 'answered' && to == 'open'
+              && answerAfter().data.status == 'draft'
+              && next().answeredAt == null && next().answeredByName == null)
+            || (from == 'open' && to == 'closed')
+            || (from == 'closed' && to == 'open')
+          );
+      }
+
+      allow delete: if false;
+
+      // Single official answer per question: answers/official.
+      match /answers/{answerId} {
+        allow get: if isAdmin()
+          || (signedIn() && answerId == 'official'
+              && resource.data.status == 'published'
+              && canReadQuestion(get(/databases/$(database)/documents/questions/$(questionId)).data));
+        allow list: if isAdmin();
+
+        allow create, update: if isAdmin() && answerId == 'official'
+          && next().keys().hasOnly(['questionId', 'adminUid', 'adminName', 'body', 'status',
+              'publishedAt', 'createdAt', 'updatedAt'])
+          && next().questionId == questionId
+          && (next().adminUid == uid() || (resource != null && next().adminUid == resource.data.adminUid))
+          && str(next().adminName, 0, 80)
+          && str(next().body, 1, 20000)
+          && next().status in ['draft', 'published']
+          && nowStamped('updatedAt')
+          && (next().status == 'published'
+              ? (nowStamped('publishedAt')
+                 && getAfter(/databases/$(database)/documents/questions/$(questionId)).data.status == 'answered')
+              : (next().publishedAt == null
+                 && getAfter(/databases/$(database)/documents/questions/$(questionId)).data.status != 'answered'));
+        allow delete: if false;
+      }
+    }
+
+    // ------------------------------------------------------------ audit log
+    match /admin_activity/{entryId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && next().keys().hasOnly(['actorUid', 'actorName', 'action', 'entityType', 'entityId',
+            'summary', 'createdAt'])
+        && next().actorUid == uid()
+        && str(next().actorName, 0, 80)
+        && str(next().action, 1, 60)
+        && str(next().entityType, 1, 30)
+        && str(next().entityId, 1, 128)
+        && str(next().summary, 0, 300)
+        && nowStamped('createdAt');
+      allow update, delete: if false;
+    }
+  }
+}
